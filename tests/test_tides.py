@@ -1,4 +1,8 @@
 """核心窗口计算算法的单元测试（仅标准库）。"""
+import random
+import statistics
+import time
+from bisect import bisect_right
 from datetime import datetime, timedelta, timezone
 
 from app.tides import (
@@ -819,6 +823,112 @@ def test_observation_anomaly_duplicate_time_last_wins():
     assert len(anomalies) == 1
     assert anomalies[0][0] == BASE + timedelta(hours=3)
     assert anomalies[0][1] == 1.0
+
+
+# ---------------------------------------------------------------------------
+# observation_anomalies 滑动阶统计实现的对照与规模测试
+# ---------------------------------------------------------------------------
+
+
+def _reference_interp(forecast, t):
+    """朴素参照：相邻点线性插值（独立实现）。"""
+    times = [p[0] for p in forecast]
+    i = bisect_right(times, t) - 1
+    if i < 0:
+        return forecast[0][1]
+    if i >= len(forecast) - 1:
+        return forecast[-1][1]
+    (t0, v0), (t1, v1) = forecast[i], forecast[i + 1]
+    frac = (t - t0).total_seconds() / (t1 - t0).total_seconds()
+    return v0 + (v1 - v0) * frac
+
+
+def _reference_anomalies(forecast, observations):
+    """逐点复制并排序邻点的朴素参照实现（规格同 observation_anomalies）。"""
+    if len(forecast) < 2:
+        return []
+    first_t, last_t = forecast[0][0], forecast[-1][0]
+    valid = {}
+    for t, h in observations:
+        if first_t <= t <= last_t:
+            valid[t] = h
+    if len(valid) < 4:
+        return []
+    times = sorted(valid)
+    residuals = {t: valid[t] - _reference_interp(forecast, t) for t in times}
+    out = []
+    for t in times:
+        neighbors = [
+            residuals[u]
+            for u in times
+            if u != t and abs((u - t).total_seconds()) <= 120 * 60
+        ]
+        if len(neighbors) < 3:
+            continue
+        baseline = statistics.median(neighbors)
+        mad = statistics.median(abs(r - baseline) for r in neighbors)
+        threshold = max(0.3, 3 * 1.4826 * mad)
+        deviation = abs(residuals[t] - baseline)
+        if deviation > threshold + 1e-9:
+            out.append((t, valid[t], residuals[t], baseline, deviation))
+    return out
+
+
+def test_observation_anomaly_matches_brute_force_randomized():
+    # 随机预报/实测（含同刻重复、覆盖外观测、±120 分钟边界附近抖动）：
+    # 滑动阶统计实现与逐点排序邻点的朴素参照逐元组一致
+    rng = random.Random(20260926)
+    for _ in range(60):
+        forecast = [
+            (BASE + timedelta(minutes=30 * i + rng.randint(0, 10)), rng.uniform(-2, 2))
+            for i in range(rng.randint(2, 6))
+        ]
+        span = (forecast[-1][0] - forecast[0][0]).total_seconds()
+        observations = []
+        for _ in range(rng.randint(0, 40)):
+            t = BASE + timedelta(seconds=rng.uniform(-300, span + 300))
+            observations.append((t, rng.uniform(-3, 3)))
+            if rng.random() < 0.2:  # 同刻重复写入，后者覆盖前者
+                observations.append((t, rng.uniform(-3, 3)))
+        assert observation_anomalies(forecast, observations) == _reference_anomalies(
+            forecast, observations
+        )
+
+
+def test_observation_anomaly_dense_window_matches_brute_force():
+    # 1500 条实测集中在 240 分钟内（互为邻点），与朴素参照一致且检出尖峰
+    rng = random.Random(7)
+    n = 1500
+    observations = [
+        (BASE + timedelta(seconds=i * 14400 / n), rng.gauss(0.0, 0.05))
+        for i in range(n)
+    ]
+    observations[n // 2] = (observations[n // 2][0], 2.0)
+    forecast = flat_forecast(6)
+    anomalies = observation_anomalies(forecast, observations)
+    assert anomalies == _reference_anomalies(forecast, observations)
+    assert BASE + timedelta(hours=2) in [a[0] for a in anomalies]
+
+
+def test_observation_anomaly_50k_points_within_240_minutes():
+    # 5 万条实测集中在 240 分钟内（每条邻点近 5 万）：滑动阶统计结构
+    # 整体秒级完成；逐点复制排序邻点的朴素实现在此规模下不可用
+    rng = random.Random(20260926)
+    n = 50000
+    observations = [
+        (BASE + timedelta(seconds=i * 14400 / n), rng.gauss(0.0, 0.05))
+        for i in range(n)
+    ]
+    observations[n // 2] = (observations[n // 2][0], 3.0)  # 02:00 尖峰
+    start = time.perf_counter()
+    anomalies = observation_anomalies(flat_forecast(6), observations)
+    elapsed = time.perf_counter() - start
+    assert elapsed < 30  # 宽松上限：O(N log²N) 约 2 秒，O(N²) 需分钟级
+    assert [a[0] for a in anomalies] == [BASE + timedelta(hours=2)]
+    assert anomalies[0][1] == 3.0        # 实测潮高
+    assert anomalies[0][2] == 3.0        # 残差（平潮预报恒 0.0）
+    assert abs(anomalies[0][3]) < 0.05   # 基线 ≈ 0
+    assert abs(anomalies[0][4] - 3.0) < 0.05
 
 
 # ---------------------------------------------------------------------------
