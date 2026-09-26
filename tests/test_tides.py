@@ -821,6 +821,72 @@ def test_observation_anomaly_duplicate_time_last_wins():
     assert anomalies[0][1] == 1.0
 
 
+def test_observation_anomaly_even_neighbor_count_baseline_and_mad_averaged():
+    # 偶数个邻点：基线取中间两残差均值，MAD 取中间两绝对偏差均值。
+    # 03:00 被评估，±120 分钟内的其他点为 01/02/04/05 时共 4 个（偶数），
+    # 残差 0.0/0.0/0.2/0.2 → 基线 0.1，绝对偏差 0.1/0.1/0.1/0.1 → MAD 0.1，
+    # 阈值 = max(0.3, 3×1.4826×0.1≈0.44478)。03:00 残差 0.6：偏离 0.5 > 0.44478 → 判异
+    observations = [
+        obs_at(1, 0.0), obs_at(2, 0.0), obs_at(3, 0.6),
+        obs_at(4, 0.2), obs_at(5, 0.2),
+    ]
+    anomalies = observation_anomalies(flat_forecast(6), observations)
+    assert len(anomalies) == 1
+    t, observed, residual, baseline, deviation = anomalies[0]
+    assert t == BASE + timedelta(hours=3)
+    assert abs(baseline - 0.1) < 1e-12
+    assert abs(deviation - 0.5) < 1e-12
+
+
+def test_observation_anomaly_identical_residuals_mad_zero():
+    # 全部残差相同：基线即该值，MAD=0，阈值退化为下限 0.3
+    observations = [obs_at(h, 0.25) for h in range(0, 6)]
+    assert observation_anomalies(flat_forecast(6), observations) == []
+    # 单点偏离恰超 0.3（相对基线 0.25，即实测 0.551）才判异
+    observations[3] = obs_at(3, 0.551)
+    anomalies = observation_anomalies(flat_forecast(6), observations)
+    assert len(anomalies) == 1
+    assert abs(anomalies[0][3] - 0.25) < 1e-12
+    assert abs(anomalies[0][4] - 0.301) < 1e-9
+
+
+def test_observation_anomaly_dense_240_minutes_uses_rank_window():
+    # 密集实测：数千条集中在 240 分钟内（每条都有大量邻点），结果仍按
+    # 中位数/MAD 规则判异且按时刻升序，不逐点排序邻点
+    n = 2001
+    step_seconds = 240 * 60 / (n - 1)
+    observations = [
+        (BASE + timedelta(seconds=i * step_seconds), 0.0 if i != n // 2 else 1.5)
+        for i in range(n)
+    ]
+    anomalies = observation_anomalies(flat_forecast(4), observations)
+    assert [a[0] for a in anomalies] == [BASE + timedelta(minutes=120)]
+    assert anomalies[0][1] == 1.5 and anomalies[0][2] == 1.5
+
+
+def test_order_statistic_multiset_ranks_and_counts_with_duplicates():
+    from app.tides import _OrderStatisticMultiset
+
+    ms = _OrderStatisticMultiset([5.0, 1.0, 3.0, 5.0, 1.0])
+    ms.add(1.0); ms.add(1.0); ms.add(3.0); ms.add(5.0)
+    assert len(ms) == 4
+    assert ms.kth(0) == 1.0 and ms.kth(1) == 1.0
+    assert ms.kth(2) == 3.0 and ms.kth(3) == 5.0
+    assert ms.count_le(0.0) == 0
+    assert ms.count_le(1.0) == 2
+    assert ms.count_le(2.5) == 2
+    assert ms.count_le(3.0) == 3
+    assert ms.count_le(9.0) == 4
+    ms.discard(1.0)
+    assert len(ms) == 3
+    assert ms.kth(0) == 1.0 and ms.kth(1) == 3.0 and ms.kth(2) == 5.0
+    # 临时移除自身再放回（质检邻点不含自身的用法）不改变集合内容
+    ms.discard(3.0)
+    assert [ms.kth(i) for i in range(len(ms))] == [1.0, 5.0]
+    ms.add(3.0)
+    assert [ms.kth(i) for i in range(len(ms))] == [1.0, 3.0, 5.0]
+
+
 # ---------------------------------------------------------------------------
 # intersect_windows / bridge_departure_windows：桥梁净空通航窗口
 # ---------------------------------------------------------------------------

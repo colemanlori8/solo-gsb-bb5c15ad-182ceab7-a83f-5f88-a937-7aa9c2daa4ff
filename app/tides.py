@@ -19,9 +19,12 @@
   即可复用现有通航窗口计算（纯内存计算，不改原预报）。
 - 实测潮高异常点质检：对落在预报覆盖范围内的每条实测记录按线性插值求残差；
   以该时刻前后各 120 分钟（含）内其他有效实测残差的中位数为局部基线，邻点
-  至少 3 个才评估；局部 MAD 为邻点残差与基线差的绝对值中位数，异常阈值取
-  max(0.3 米, 3 × 1.4826 × MAD)，仅返回偏离基线严格超过阈值的点（纯内存
-  只读计算，不影响校准窗口与预约）。
+  至少 3 个才评估（端点计入）；局部 MAD 为邻点残差与基线差的绝对值中位数
+  （偶数取中间两数均值），异常阈值取 max(0.3 米, 3 × 1.4826 × MAD)，仅返回
+  偏离基线严格超过阈值（沿用浮点容差）的点。密集实测下邻点以“可增删、按秩
+  查询”的滑动有序多重集（离散化 + Fenwick 树）维护，MAD 在基线变化后由两条
+  按秩读取的升序虚流精确合并求出，不逐点复制、不排序全部邻点（纯内存只读
+  计算，不影响校准窗口与预约）。
 - 可预约时段查询：在潮汐可出发时段与请求允许范围的交集上，按“每条有效预约
   占用 [a, b] 禁止出发 (a−时长, b)”逐条扣除（开区间，端点保留即首尾相接允许），
   零长度但可用的单点出发时刻保留，返回剩余全部可预约出发时段（按时间升序）。
@@ -43,7 +46,7 @@
 """
 from __future__ import annotations
 
-from bisect import bisect_left, bisect_right
+from bisect import bisect_right
 from datetime import datetime, timezone
 
 _EPS = 1e-9  # 浮点容差，保证“恰好达标”的端点被纳入
@@ -455,6 +458,19 @@ def calibrated_forecast_points(
 
 # ---------------------------------------------------------------------------
 # 实测潮高异常点质检
+#
+# 密集实测（如 5 万点集中在 240 分钟内）下，逐点复制窗口邻点再排序会造成
+# O(N·k) 的计算膨胀。实现用一个“可增删、按秩查询”的滑动有序多重集维护
+# 当前 ±120 分钟窗口：离散化 + 树状数组（Fenwick），增删与按秩取值均为
+# O(log N)，不逐点遍历、不排序窗口内邻点。
+#
+# 基线 = 邻点残差中位数，直接按秩取得。基线变化后 MAD 仍需精确：窗口内
+# 绝对偏差 |r − 基线| 的有序序列是两条升序“虚流”的并集——
+#   左流（r ≤ 基线）：基线 − r，按残差降序读取即为升序；
+#   右流（r > 基线）：r − 基线，按残差升序读取；
+# 两流元素都只通过树状数组按秩查询取得，用双有序数组第 k 小的分治求并集
+# 中位秩，O(log² N) 内精确得到 MAD（偶数取中间两数均值），不展开邻点。
+# 整体时间 O((F+N) log²(F+N))、空间 O(F+N)。
 # ---------------------------------------------------------------------------
 
 _ANOMALY_WINDOW_SECONDS = 120 * 60  # 前后各 120 分钟（含端点）取邻点
@@ -464,14 +480,157 @@ _ANOMALY_MAD_K = 1.4826             # MAD → 标准差的一致性系数
 _ANOMALY_SIGMA = 3.0                # 3σ 判异
 
 
-def _median(values: list[float]) -> float:
-    """中位数（偶数个时取中间两个的算术平均），调用方需保证非空。"""
-    ordered = sorted(values)
-    n = len(ordered)
-    mid = n // 2
-    if n % 2:
-        return ordered[mid]
-    return (ordered[mid - 1] + ordered[mid]) / 2
+class _OrderStatisticMultiset:
+    """离散化 + 树状数组实现的有序多重集（可增删、按秩查询，纯标准库）。
+
+    离散化全集在构造时一次性给定（质检中即全部有效残差），维护期支持：
+    - ``add(value)`` / ``discard(value)``：插入/删除一个元素，O(log m)；
+    - ``count_le(value)``：不大于 value 的元素个数，O(log m)；
+    - ``kth(k)``：按秩（0 起）取第 k 小元素，O(log m)；
+    - ``len()``：当前元素总数。
+
+    所有操作只走树状数组下标，从不遍历或排序当前窗口内的元素，重复值
+    以多重计数天然支持。
+    """
+
+    __slots__ = ("_coords", "_index", "_tree", "_total")
+
+    def __init__(self, universe: list[float]) -> None:
+        self._coords = sorted(set(universe))
+        self._index = {v: i + 1 for i, v in enumerate(self._coords)}
+        self._tree = [0] * (len(self._coords) + 1)
+        self._total = 0
+
+    def add(self, value: float, delta: int = 1) -> None:
+        i = self._index[value]
+        tree = self._tree
+        size = len(tree)
+        while i < size:
+            tree[i] += delta
+            i += i & -i
+        self._total += delta
+
+    def discard(self, value: float) -> None:
+        self.add(value, -1)
+
+    def count_le(self, value: float) -> int:
+        """不大于 value 的元素个数（value 不必属于离散化全集）。"""
+        i = bisect_right(self._coords, value)
+        tree = self._tree
+        total = 0
+        while i:
+            total += tree[i]
+            i -= i & -i
+        return total
+
+    def kth(self, k: int) -> float:
+        """第 k（0 起）小元素；调用方需保证 0 <= k < 总数。"""
+        idx = 0
+        tree = self._tree
+        size = len(tree)
+        bit = 1 << (size.bit_length() - 1)
+        while bit:
+            nxt = idx + bit
+            if nxt < size and tree[nxt] <= k:
+                idx = nxt
+                k -= tree[nxt]
+            bit >>= 1
+        # Fenwick 为 1 基：首个前缀和超过原 k 的位置是 idx+1，对应离散值下标 idx
+        return self._coords[idx]
+
+    def __len__(self) -> int:
+        return self._total
+
+
+def _interpolated_values(
+    points: list[ForecastPoint], query_times: list[datetime]
+) -> list[float]:
+    """query_times 升序且均落在 points 覆盖内时，各时刻线性插值取值，O(F+N)。
+
+    与逐点 ``_piecewise_linear``（二分 + 插值）结果一致；单段指针随查询时刻
+    单调前移，不回退，避免对每条观测重扫预报序列。
+    """
+    out: list[float] = []
+    seg = 0
+    last_seg = len(points) - 2
+    for t in query_times:
+        while seg < last_seg and points[seg + 1][0] < t:
+            seg += 1
+        t0, v0 = points[seg]
+        t1, v1 = points[seg + 1]
+        if t1 == t0:
+            out.append(v1)
+        else:
+            frac = (t - t0).total_seconds() / (t1 - t0).total_seconds()
+            out.append(v0 + (v1 - v0) * frac)
+    return out
+
+
+def _median_ranks(count: int) -> tuple[int, int]:
+    """count 个元素的中位秩：奇数两秩相同，偶数为中间两秩（0 起）。"""
+    return (count - 1) // 2, count // 2
+
+
+def _union_kth_abs_deviation(
+    window: _OrderStatisticMultiset,
+    baseline: float,
+    left_count: int,
+    right_count: int,
+    k: int,
+    cache: dict[int, float],
+) -> float:
+    """绝对偏差并集（见类说明）中的第 k（0 起）小值，O(log² count)。
+
+    窗口残差按升序记 r_0…，绝对偏差的升序序列是两条升序虚流的并集：
+    - 左流 A（r ≤ baseline，共 left_count 个）：A[p] = baseline − r_{L-1-p}；
+    - 右流 B（r > baseline，共 right_count 个）：B[q] = r_{L+q} − baseline。
+    两流元素只经 Fenwick 按秩查询取得；用双有序数组第 k 小的分治，每轮
+    比较两流第 i/j 个元素并丢弃前半段。``cache`` 复用同一点内已取过的残差秩。
+    """
+    kth_value = window.kth
+
+    def rank_value(rank: int) -> float:
+        value = cache.get(rank)
+        if value is None:
+            value = kth_value(rank)
+            cache[rank] = value
+        return value
+
+    def left_value(index: int) -> float:
+        return baseline - rank_value(left_count - 1 - index)
+
+    def right_value(index: int) -> float:
+        return rank_value(left_count + index) - baseline
+
+    # 两流以 (长度, 起点, 取值函数) 表示；分治时始终把较短流放到 A
+    len_a, len_b = left_count, right_count
+    off_a, off_b = 0, 0
+    get_a, get_b = left_value, right_value
+    while True:
+        if len_a > len_b:
+            len_a, len_b = len_b, len_a
+            off_a, off_b = off_b, off_a
+            get_a, get_b = get_b, get_a
+        if len_a == 0:
+            return get_b(off_b + k)
+        if k == 0:
+            va, vb = get_a(off_a), get_b(off_b)
+            return va if va <= vb else vb
+        i = (k - 1) // 2
+        if i >= len_a:
+            i = len_a - 1
+        j = (k - 1) // 2
+        if j >= len_b:
+            j = len_b - 1
+        if get_a(off_a + i) > get_b(off_b + j):
+            # B 前 j+1 个不可能超过第 k 小，整段丢弃
+            off_b += j + 1
+            len_b -= j + 1
+            k -= j + 1
+        else:
+            off_a += i + 1
+            len_a -= i + 1
+            k -= i + 1
 
 
 def observation_anomalies(
@@ -485,12 +644,17 @@ def observation_anomalies(
     - 邻点 = 实测时刻前后各 120 分钟（含）内的**其他**有效实测记录
       （落在预报覆盖范围内才有残差，范围外的观测不参与）；
     - 局部基线 = 邻点残差的中位数；邻点不足 3 个时不评估该记录；
-    - 局部 MAD = 邻点残差与基线之差绝对值的中位数；
+    - 局部 MAD = 邻点残差与基线之差绝对值的中位数（偶数取中间两数均值）；
     - 异常阈值 = max(0.3, 3 × 1.4826 × MAD)；
-    - 仅返回 |残差 − 基线| 严格大于阈值的记录。
+    - 仅返回 |残差 − 基线| 严格大于阈值（沿用 _EPS 浮点容差）的记录。
+
+    邻点以滑动有序多重集（Fenwick 树）维护：时间窗左右界各随被评估时刻
+    单调移动，每个邻点至多增删各一次；基线按秩取中位数，MAD 在基线变化
+    后仍由两条按秩读取的升序虚流精确合并求出，全程不逐点遍历、不排序
+    窗口邻点。总时间 O((F+N) log²(F+N))、空间 O(F+N)。
 
     返回按时刻升序的 (时刻, 实测潮高, 残差, 基线, 偏离量)；预报不足 2 点
-    或无足够邻点时返回空列表。
+    或无足够邻点时返回空列表。观测同刻去重以最后一个为准（与现状一致）。
     """
     if len(forecast) < 2:
         return []
@@ -506,29 +670,78 @@ def observation_anomalies(
         return []
 
     valid_times = sorted(valid)
+    # 各观测时刻的线性插值预报（单指针随时间前移），残差 = 实测 − 预报
+    predicted = _interpolated_values(forecast, valid_times)
+    residuals = [valid[t] - v for t, v in zip(valid_times, predicted)]
     ts = [t.timestamp() for t in valid_times]
-    residuals: dict[datetime, float] = {}
-    for t in valid_times:
-        residuals[t] = valid[t] - _piecewise_linear(forecast, t)
+    n = len(residuals)
+
+    # 滑动时间窗 [center−120min, center+120min] 的残差有序多重集
+    window = _OrderStatisticMultiset(residuals)
+    win_add = window.add
+    win_discard = window.discard
+    win_kth = window.kth
+    win_count_le = window.count_le
+    left = right = 0
 
     anomalies: list[tuple[datetime, float, float, float, float]] = []
-    for idx, t in enumerate(valid_times):
+    for idx in range(n):
         center = ts[idx]
-        lo = bisect_left(ts, center - _ANOMALY_WINDOW_SECONDS)
-        hi = bisect_right(ts, center + _ANOMALY_WINDOW_SECONDS)
-        neighbor_res = [
-            residuals[valid_times[j]] for j in range(lo, hi) if j != idx
-        ]
-        if len(neighbor_res) < _ANOMALY_MIN_NEIGHBORS:
+        window_lo = center - _ANOMALY_WINDOW_SECONDS
+        window_hi = center + _ANOMALY_WINDOW_SECONDS
+        while left < n and ts[left] < window_lo:  # 滑出左界（含端点保留）
+            win_discard(residuals[left])
+            left += 1
+        while right < n and ts[right] <= window_hi:  # 滑入右界（含端点计入）
+            win_add(residuals[right])
+            right += 1
+
+        neighbor_count = len(window) - 1  # 剔除被评估点自身
+        if neighbor_count < _ANOMALY_MIN_NEIGHBORS:
             continue
-        baseline = _median(neighbor_res)
-        mad = _median([abs(r - baseline) for r in neighbor_res])
+
+        own = residuals[idx]
+        win_discard(own)  # 邻点不含自身；查询期间临时移除，随后放回
+        # 同一点内复用已取过的残差秩（基线中位秩与 MAD 合并探测秩重叠）
+        rank_cache: dict[int, float] = {}
+
+        # 基线 = 邻点残差中位数（按秩查询；偶数取中间两数均值）
+        base_lo_rank, base_hi_rank = _median_ranks(neighbor_count)
+        base_lo = win_kth(base_lo_rank)
+        rank_cache[base_lo_rank] = base_lo
+        if base_lo_rank == base_hi_rank:
+            baseline = base_lo
+        else:
+            base_hi = win_kth(base_hi_rank)
+            rank_cache[base_hi_rank] = base_hi
+            baseline = (base_lo + base_hi) / 2
+
+        # MAD：基线变化后仍精确——左/右两条绝对偏差升序虚流按秩合并取中位
+        left_count = win_count_le(baseline)
+        mad_lo_rank, mad_hi_rank = _median_ranks(neighbor_count)
+        mad = _union_kth_abs_deviation(
+            window, baseline, left_count,
+            neighbor_count - left_count, mad_lo_rank, rank_cache,
+        )
+        if mad_lo_rank != mad_hi_rank:
+            mad = (
+                mad
+                + _union_kth_abs_deviation(
+                    window, baseline, left_count,
+                    neighbor_count - left_count, mad_hi_rank, rank_cache,
+                )
+            ) / 2
+
+        win_add(own)
+
         threshold = max(
             _ANOMALY_MIN_THRESHOLD, _ANOMALY_SIGMA * _ANOMALY_MAD_K * mad
         )
-        deviation = abs(residuals[t] - baseline)
+        deviation = abs(own - baseline)
         if deviation > threshold + _EPS:
-            anomalies.append((t, valid[t], residuals[t], baseline, deviation))
+            anomalies.append(
+                (valid_times[idx], valid[valid_times[idx]], own, baseline, deviation)
+            )
     return anomalies
 
 
